@@ -9,7 +9,10 @@
 
 mod gui;
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use fltk::prelude::*;
@@ -20,6 +23,27 @@ use escape_proxy::app::controller;
 use escape_proxy::app::state::{ProxyState, SharedAppState, StatusSnapshot};
 use escape_proxy::logging;
 use escape_proxy::platform::windows::{autostart, instance, tray};
+
+thread_local! {
+    /// The periodic UI refresh runs from an FLTK timeout (which fires inside
+    /// `wait()` on this thread), so it reaches the window through here.
+    static UI: RefCell<Option<(Arc<SharedAppState>, Rc<RefCell<gui::window::MainWindow>>)>> =
+        const { RefCell::new(None) };
+}
+
+fn ui_tick(handle: fltk::app::TimeoutHandle) {
+    // One-shot timeout: re-arm, then refresh the window if it is visible.
+    fltk::app::repeat_timeout3(0.5, handle);
+    UI.with(|slot| {
+        let borrowed = slot.borrow();
+        if let Some((state, window)) = borrowed.as_ref() {
+            let visible = window.borrow().win.visible();
+            if visible {
+                window.borrow_mut().tick(state, false);
+            }
+        }
+    });
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -72,12 +96,12 @@ fn main() {
     let _app = fltk::app::App::default();
     gui::theme::apply();
     let show_at_start = !launch_hidden || state.snapshot().show_on_startup;
-    let mut main_window = gui::window::build(
+    let window = Rc::new(RefCell::new(gui::window::build(
         state.clone(),
         cmd_tx.clone(),
         root.clone(),
         show_at_start,
-    );
+    )));
     // Wake callback must exist before the tray thread starts.
     state.set_wake_gui(Box::new(|| fltk::app::awake()));
 
@@ -93,25 +117,29 @@ fn main() {
     };
 
     // --- FLTK event loop -----------------------------------------------------
-    // Custom loop instead of `app::run()`: `run()` returns once all windows
-    // are hidden, but the tray must keep the app alive with the settings
-    // window closed. `wait_for` sleeps on the OS message queue (no busy
-    // spin), and `awake()` wakes it immediately for cross-thread events.
+    // `app::run()`/`wait()`-style blocking is required: with this fltk
+    // version, the timed `wait_for()` variant sleeps but never dispatches
+    // widget events, which made every control dead. `wait()` blocks in the
+    // OS message queue (idle CPU stays ~0) and `awake()` wakes it for
+    // cross-thread events. When all windows are hidden (tray-only),
+    // `wait()` returns immediately, so a short sleep throttles the loop.
+    UI.with(|slot| *slot.borrow_mut() = Some((state.clone(), window.clone())));
+    fltk::app::add_timeout3(0.5, ui_tick);
+
     loop {
         if state.exit_requested.load(Ordering::SeqCst) {
             break;
         }
-        let _ = fltk::app::wait_for(0.5);
+        let more = fltk::app::wait();
 
-        let mut config_changed = false;
         let mut exit = false;
         for event in state.take_events() {
             match event {
-                GuiEvent::ShowSettings => main_window.show_window(),
+                GuiEvent::ShowSettings => window.borrow_mut().show_window(),
                 GuiEvent::StatusChanged => {
-                    config_changed = true;
-                    if main_window.win.visible() {
-                        main_window.tick(&state, true);
+                    let visible = window.borrow().win.visible();
+                    if visible {
+                        window.borrow_mut().tick(&state, true);
                     }
                 }
                 GuiEvent::AutostartChanged(_) => {
@@ -123,16 +151,16 @@ fn main() {
         if exit || state.exit_requested.load(Ordering::SeqCst) {
             break;
         }
-        // Periodic refresh only while the window is visible.
-        if main_window.win.visible() {
-            main_window.tick(&state, config_changed);
+        if !more {
+            // No visible windows: throttle instead of spinning.
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 
     // --- shutdown ------------------------------------------------------------
     tracing::info!("shutting down");
     state.exit_requested.store(true, Ordering::SeqCst);
-    main_window.win.hide();
+    window.borrow_mut().win.hide();
     let _ = cmd_tx.blocking_send(AppCommand::Shutdown);
     rt.shutdown_timeout(Duration::from_secs(3));
     if let Some(handle) = tray_thread {

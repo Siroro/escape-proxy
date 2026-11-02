@@ -24,10 +24,10 @@ use escape_proxy::platform::windows;
 use crate::gui::{domains, overview, settings, theme};
 
 pub const W: i32 = 480;
-pub const COLLAPSED_H: i32 = 600;
-pub const EXPANDED_H: i32 = 790;
-/// Fixed slot the advanced card occupies while expanded.
-const ADVANCED_H: i32 = 190;
+pub const COLLAPSED_H: i32 = 560;
+pub const EXPANDED_H: i32 = 730;
+/// Fixed slot the advanced section occupies while expanded.
+const ADVANCED_H: i32 = 168;
 
 const HINT_RESTRICTED: &str = "Only the listed domains and their subdomains are forwarded.";
 const HINT_UNRESTRICTED: &str = "All domains are forwarded. Enable \u{201c}Restrict to list\u{201d} to limit to the list below.";
@@ -53,15 +53,20 @@ pub struct MainWindow {
 
 // ------------------------------------------------------------- card helpers
 
-/// A section card: column flex with the panel background and rounded
-/// corners.
-fn card() -> Flex {
+/// A flat section: column flex, no card chrome. Sections are separated by a
+/// thin separator line in the outer column.
+fn section() -> Flex {
     let mut c = Flex::default().column();
-    c.set_frame(FrameType::RoundedBox);
-    c.set_color(theme::CARD);
-    c.set_pad(12);
     c.set_spacing(7);
     c
+}
+
+/// Thin separator line between sections.
+fn separator(col: &mut Flex) {
+    let mut sep = Frame::default();
+    col.fixed(&sep, 2);
+    sep.set_frame(FrameType::FlatBox);
+    sep.set_color(theme::SEPARATOR);
 }
 
 /// Small uppercase-style section title, standalone (no trailing control).
@@ -121,7 +126,7 @@ fn style_input<I: WidgetExt + InputExt>(input: &mut I) {
 }
 
 fn style_button(b: &mut Button) {
-    b.set_frame(FrameType::RoundedBox);
+    b.set_frame(FrameType::FlatBox);
     b.set_color(theme::INPUT_BG);
     b.set_label_color(theme::TEXT);
     b.set_label_size(13);
@@ -161,9 +166,9 @@ pub fn build(
     header.fixed(&status_badge, 130);
     header.end();
 
-    // ---- card: proxy -------------------------------------------------------
-    let mut proxy_card = card();
-    col.fixed(&proxy_card, 188);
+    // ---- section: proxy -------------------------------------------------------
+    let mut proxy_card = section();
+    col.fixed(&proxy_card, 165);
     title_label(&mut proxy_card, "PROXY");
 
     let mut enabled_row = Flex::default().row();
@@ -175,7 +180,7 @@ pub fn build(
     enabled_row.fixed(&enabled_label, 150);
     let _gap = Frame::default();
     let mut enabled_toggle = ToggleButton::default().with_label("ON");
-    enabled_toggle.set_frame(FrameType::RoundedBox);
+    enabled_toggle.set_frame(FrameType::FlatBox);
     enabled_toggle.set_color(theme::INPUT_BG);
     enabled_toggle.set_selection_color(theme::GREEN_FACE);
     enabled_toggle.set_label_size(13);
@@ -202,9 +207,11 @@ pub fn build(
     proxy_card.fixed(&error_label, 14);
     proxy_card.end();
 
-    // ---- card: domains -----------------------------------------------------
-    let mut domains_card = card();
-    // No fixed height: this card flexes with the window.
+    separator(&mut col);
+
+    // ---- section: domains -----------------------------------------------------
+    let mut domains_card = section();
+    // No fixed height: this section flexes with the window.
 
     let mut filter_row = Flex::default().row();
     domains_card.fixed(&filter_row, 24);
@@ -283,9 +290,11 @@ pub fn build(
         remove_btn.set_callback(move |_| domains::remove_selected(&browser, &state, &cmd_tx));
     }
 
-    // ---- card: windows ------------------------------------------------------
-    let mut windows_card = card();
-    col.fixed(&windows_card, 118);
+    separator(&mut col);
+
+    // ---- section: windows ------------------------------------------------------
+    let mut windows_card = section();
+    col.fixed(&windows_card, 96);
     title_label(&mut windows_card, "WINDOWS");
     let mut autostart_check = CheckButton::default().with_label("Start with Windows");
     style_check(&mut autostart_check);
@@ -310,8 +319,10 @@ pub fn build(
     windows_card.fixed(&windows_hint, 14);
     windows_card.end();
 
-    // ---- card: advanced (collapsible) ----------------------------------------
-    let mut advanced_section = card();
+    separator(&mut col);
+
+    // ---- section: advanced (collapsible) ----------------------------------------
+    let mut advanced_section = section();
     // Height set when toggling; hidden while collapsed.
 
     let mut adv_row = Flex::default().row();

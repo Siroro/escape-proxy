@@ -5,10 +5,6 @@
 use fltk::app;
 use fltk::enums::Color;
 
-/// Window background.
-pub const WINDOW_BG: Color = Color::from_rgb(22, 25, 31);
-/// Section card background.
-pub const CARD: Color = Color::from_rgb(36, 41, 53);
 /// Inputs, browsers and button faces.
 pub const INPUT_BG: Color = Color::from_rgb(46, 52, 66);
 pub const INPUT_BG_HI: Color = Color::from_rgb(52, 58, 73);
