@@ -57,6 +57,7 @@ fn main() {
         tx_bytes: 0,
         rx_bytes: 0,
         domains: Vec::new(),
+        restrict_domains: false,
         autostart: autostart::is_enabled().unwrap_or(false),
         show_on_startup: false,
         max_connections: 128,

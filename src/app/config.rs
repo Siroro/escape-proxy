@@ -71,6 +71,10 @@ pub struct Config {
     pub connect_timeout_ms: u64,
     #[serde(default = "default_timeout")]
     pub handshake_timeout_ms: u64,
+    /// When `true`, only the listed domains are allowed. Default `false`:
+    /// every valid hostname is forwarded (like the old `allow *` 3proxy).
+    #[serde(default)]
+    pub restrict_domains: bool,
     #[serde(default)]
     pub domains: Vec<String>,
     #[serde(default)]
@@ -101,6 +105,7 @@ impl Default for Config {
             max_connections: default_max_connections(),
             connect_timeout_ms: default_timeout(),
             handshake_timeout_ms: default_timeout(),
+            restrict_domains: false,
             domains: Vec::new(),
             ui: UiConfig::default(),
         }
@@ -117,6 +122,7 @@ pub struct ValidatedConfig {
     pub handshake_timeout: Duration,
     /// Normalised, deduplicated, sorted.
     pub domains: Vec<String>,
+    pub restrict_domains: bool,
     pub ui: UiConfig,
 }
 
@@ -151,6 +157,7 @@ impl Config {
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
             handshake_timeout: Duration::from_millis(self.handshake_timeout_ms),
             domains: set.into_iter().collect(),
+            restrict_domains: self.restrict_domains,
             ui: self.ui.clone(),
         })
     }
@@ -162,6 +169,7 @@ impl Config {
             max_connections: v.max_connections,
             connect_timeout_ms: v.connect_timeout.as_millis() as u64,
             handshake_timeout_ms: v.handshake_timeout.as_millis() as u64,
+            restrict_domains: v.restrict_domains,
             domains: v.domains.clone(),
             ui: v.ui.clone(),
         }

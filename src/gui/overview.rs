@@ -1,4 +1,4 @@
-//! Overview section: status light and runtime info presentation.
+//! Overview section: status badge and error line presentation.
 
 use fltk::enums::Color;
 use fltk::frame::Frame;
@@ -17,24 +17,19 @@ pub fn status_appearance(snapshot: &StatusSnapshot) -> (&'static str, Color) {
     }
 }
 
-/// Refreshes the status dot, status text and the transient error line.
-/// Values are only touched when they actually changed — unconditional
-/// `set_label` calls would mark the window damaged on every tick and keep
-/// the FLTK loop from sleeping.
-pub fn refresh_status(
-    dot: &mut Frame,
-    label: &mut Frame,
-    error_label: &mut Frame,
-    snapshot: &StatusSnapshot,
-) {
+/// Refreshes the status badge and the transient error line. Values are only
+/// touched when they actually changed — unconditional `set_label` calls
+/// would mark the window damaged on every tick and keep the FLTK loop from
+/// sleeping.
+pub fn refresh_status(badge: &mut Frame, error_label: &mut Frame, snapshot: &StatusSnapshot) {
     let (text, color) = status_appearance(snapshot);
-    if dot.label_color() != color {
-        dot.set_label_color(color);
-        dot.redraw();
+    let badge_label = format!("\u{25cf} {text}");
+    if badge.label() != badge_label {
+        badge.set_label(&badge_label);
     }
-    if label.label() != text {
-        label.set_label(text);
-        label.redraw();
+    if badge.label_color() != color {
+        badge.set_label_color(color);
+        badge.redraw();
     }
     let error_text: &str = match (&snapshot.state, snapshot.last_error.as_deref()) {
         (ProxyState::Error(e), _) => e.as_str(),

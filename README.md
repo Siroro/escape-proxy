@@ -21,12 +21,15 @@ background services.**
 
 - SOCKS5 (RFC 1928): no-auth, TCP CONNECT only; BIND and UDP ASSOCIATE are
   rejected.
-- Domain allowlist with IDNA (punycode) normalisation and dot-guarded
-  subdomain matching (`sub.google.com` matches `google.com`;
+- **All domains are allowed by default** (matching the old `allow *` 3proxy
+  behaviour). Optionally enable **Restrict to list** in the settings window to
+  limit forwarding to a domain allowlist with IDNA (punycode) normalisation
+  and dot-guarded subdomain matching (`sub.google.com` matches `google.com`;
   `evilgoogle.com` never does).
-- Strict destination policy: literal-IP requests are rejected, hostnames are
-  resolved via system DNS, and only public routable addresses are connected
-  (loopback/private/CGNAT/link-local/reserved ranges are refused).
+- Strict address policy either way: literal-IP requests are rejected,
+  hostnames are resolved via system DNS, and only public routable addresses
+  are connected (loopback/private/CGNAT/link-local/reserved ranges are
+  refused).
 - Fail closed: pausing or exiting never opens an alternate outbound route.
 - System tray: status icon (green running / gray paused / yellow recent
   failures / red error), enable toggle, settings, autostart, logs, exit.
@@ -62,6 +65,7 @@ enabled = true
 max_connections = 128
 connect_timeout_ms = 5000
 handshake_timeout_ms = 5000
+restrict_domains = false
 domains = [
     "google.com",
 ]
@@ -72,6 +76,9 @@ theme = "dark"
 ```
 
 - The bind IP is fixed at `127.0.0.1`; only the port is configurable.
+- `restrict_domains = false` (default): every valid hostname is forwarded.
+  Set it to `true` (or toggle **Restrict to list** in the GUI) to allow only
+  the entries in `domains`.
 - Changes made in the settings window apply immediately and are saved
   atomically (write-temp-then-rename); there is no file watcher.
 - Autostart state lives in the registry (`HKCU\...\Run`), not in the config;
@@ -129,8 +136,11 @@ exist for the integration tests; production defaults are strict.
 ## Security notes
 
 - The proxy listens on loopback only.
-- Destination allowlist + public-IP-only policy mean a compromised browser
-  pattern cannot reach LAN/internal addresses through this proxy.
+- By default **all domains** are forwarded (like the 3proxy setup this
+  replaces). Enable **Restrict to list** for an allowlist posture.
+- Either way, the address policy still blocks literal-IP requests and any
+  destination that resolves to a non-public address, so a browser pattern
+  cannot reach LAN/internal hosts through this proxy.
 - Logs record lifecycle, listener failures, config changes and refused
   destinations — not browsing histories or payloads.
 - No telemetry, no updates, no web dashboard.

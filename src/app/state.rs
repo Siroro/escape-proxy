@@ -25,6 +25,8 @@ pub struct StatusSnapshot {
     /// Destination -> client.
     pub rx_bytes: u64,
     pub domains: Vec<String>,
+    /// When true, only allowlisted domains are forwarded.
+    pub restrict_domains: bool,
     pub autostart: bool,
     pub show_on_startup: bool,
     /// Effective advanced settings (for refreshing the form).

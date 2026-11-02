@@ -11,10 +11,11 @@ $bmp = New-Object System.Drawing.Bitmap $size, $size
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
 $g.Clear([System.Drawing.Color]::Transparent)
+# Keep generous padding so the small title-bar rendering never looks crowded.
 $fill = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 76, 175, 80))
-$ring = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 24, 28, 34)), 3
-$g.FillEllipse($fill, 3, 3, 26, 26)
-$g.DrawEllipse($ring, 4.5, 4.5, 23, 23)
+$ring = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 24, 28, 34)), 2
+$g.FillEllipse($fill, 5, 5, 22, 22)
+$g.DrawEllipse($ring, 6.5, 6.5, 19, 19)
 $g.Dispose()
 
 $ms = New-Object System.IO.MemoryStream

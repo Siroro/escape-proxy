@@ -16,7 +16,7 @@ use escape_proxy::app::commands::AppCommand;
 use escape_proxy::app::config::{self, Config};
 use escape_proxy::app::controller;
 use escape_proxy::app::state::{ProxyState, SharedAppState, StatusSnapshot};
-use escape_proxy::core::matcher::DomainList;
+use escape_proxy::core::matcher::{DomainList, DomainPolicy};
 use escape_proxy::core::server::{
     DestinationPolicy, ProxyServer, ServerConfig, SharedDomains,
 };
@@ -43,10 +43,13 @@ fn test_config(listen: SocketAddr, max_connections: usize) -> ServerConfig {
     }
 }
 
+/// Starts a proxy restricted to `domains` (classic allowlist behaviour).
 async fn start_proxy(domains: &[&str], max_connections: usize) -> TestProxy {
-    let shared: SharedDomains = Arc::new(tokio::sync::RwLock::new(Arc::new(
-        DomainList::new(domains).unwrap(),
-    )));
+    start_proxy_with_policy(DomainPolicy::restricted(DomainList::new(domains).unwrap()), max_connections).await
+}
+
+async fn start_proxy_with_policy(policy: DomainPolicy, max_connections: usize) -> TestProxy {
+    let shared: SharedDomains = Arc::new(tokio::sync::RwLock::new(Arc::new(policy)));
     let (enabled_tx, enabled_rx) = tokio::sync::watch::channel(true);
     let server = ProxyServer::start(
         test_config("127.0.0.1:0".parse().unwrap(), max_connections),
@@ -210,10 +213,38 @@ async fn unknown_domain_is_rejected_by_policy() {
 }
 
 #[tokio::test]
+async fn all_domains_allowed_when_unrestricted() {
+    let echo = spawn_echo().await;
+    // Unrestricted policy with an empty list: everything valid is forwarded.
+    let proxy = start_proxy_with_policy(DomainPolicy::unrestricted(), 16).await;
+
+    // Unknown domain passes the filter (fails later at DNS with a different
+    // reply code than the policy rejection).
+    let (_, reply) = socks_connect(proxy.addr, "totally-unknown.test", echo.port()).await.unwrap();
+    assert_ne!(reply[1], 2, "unrestricted mode must not reject by policy");
+
+    // Real domain still works end to end.
+    let (mut client, reply) = socks_connect(proxy.addr, "localhost", echo.port()).await.unwrap();
+    assert_eq!(reply[1], 0);
+    client.write_all(b"open").await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"open");
+
+    // Restricting the shared policy takes effect without a restart.
+    *proxy.domains.write().await = Arc::new(DomainPolicy::restricted(
+        DomainList::new(["localhost"]).unwrap(),
+    ));
+    let (_, reply) = socks_connect(proxy.addr, "totally-unknown.test", echo.port()).await.unwrap();
+    assert_eq!(reply[1], 2, "restricted mode must reject unknown domains");
+    proxy.server.shutdown().await;
+}
+
+#[tokio::test]
 async fn ip_literals_rejected_by_default_policy() {
     let echo = spawn_echo().await;
     let shared: SharedDomains = Arc::new(tokio::sync::RwLock::new(Arc::new(
-        DomainList::new(["localhost"]).unwrap(),
+        DomainPolicy::restricted(DomainList::new(["localhost"]).unwrap()),
     )));
     let (_tx, rx) = tokio::sync::watch::channel(true);
     let mut cfg = test_config("127.0.0.1:0".parse().unwrap(), 16);
@@ -235,7 +266,9 @@ async fn allowlist_updates_apply_without_restart() {
     assert_eq!(reply[1], 2, "not in allowlist");
 
     // Swap the allowlist under the running server.
-    *proxy.domains.write().await = Arc::new(DomainList::new(["localhost", "fresh.example"]).unwrap());
+    *proxy.domains.write().await = Arc::new(DomainPolicy::restricted(
+        DomainList::new(["localhost", "fresh.example"]).unwrap(),
+    ));
     let (_, reply) = socks_connect(proxy.addr, "fresh.example", echo.port()).await.unwrap();
     // `fresh.example` does not resolve in system DNS: the allowlist passed,
     // so the failure must no longer be the policy code.
@@ -353,6 +386,7 @@ fn controller_snapshot() -> StatusSnapshot {
         tx_bytes: 0,
         rx_bytes: 0,
         domains: Vec::new(),
+        restrict_domains: false,
         autostart: false,
         show_on_startup: false,
         max_connections: 128,
@@ -416,6 +450,15 @@ async fn controller_lifecycle_headless() {
         .unwrap();
     eventually(|| state.live_snapshot().domains == vec!["a.example".to_string(), "b.example".to_string()])
         .await;
+
+    // Restrict-to-list toggles live and persists (default is unrestricted).
+    assert!(!state.live_snapshot().restrict_domains);
+    cmd_tx.send(AppCommand::SetRestrictDomains(true)).await.unwrap();
+    eventually(|| state.live_snapshot().restrict_domains).await;
+    assert!(config::load(&path).unwrap().restrict_domains);
+    cmd_tx.send(AppCommand::SetRestrictDomains(false)).await.unwrap();
+    eventually(|| !state.live_snapshot().restrict_domains).await;
+    assert!(!config::load(&path).unwrap().restrict_domains);
 
     // Invalid domain list is rejected and reported.
     cmd_tx

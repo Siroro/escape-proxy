@@ -10,6 +10,9 @@ pub enum AppCommand {
     SetEnabled(bool),
     /// Replace the entire domain allowlist.
     UpdateDomains(Vec<String>),
+    /// Restrict forwarding to the allowlist (`true`) or allow every valid
+    /// hostname (`false`, default).
+    SetRestrictDomains(bool),
     /// Apply advanced settings. Port or limit changes require a listener
     /// rebind.
     ApplyAdvanced {

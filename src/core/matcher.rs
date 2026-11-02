@@ -139,6 +139,48 @@ impl DomainList {
     }
 }
 
+/// Effective destination-hostname policy. By default every structurally
+/// valid hostname is allowed (matching the original `allow *` 3proxy setup);
+/// enabling `restrict` limits access to the allowlist.
+#[derive(Debug, Clone)]
+pub struct DomainPolicy {
+    /// When `true`, only allowlisted hostnames pass. When `false` (default),
+    /// every valid hostname is allowed.
+    pub restrict: bool,
+    pub list: DomainList,
+}
+
+impl DomainPolicy {
+    pub fn new(restrict: bool, list: DomainList) -> Self {
+        Self { restrict, list }
+    }
+
+    pub fn unrestricted() -> Self {
+        Self {
+            restrict: false,
+            list: DomainList::default(),
+        }
+    }
+
+    pub fn restricted(list: DomainList) -> Self {
+        Self {
+            restrict: true,
+            list,
+        }
+    }
+
+    /// True if the requested host passes the policy. In unrestricted mode a
+    /// hostname still has to normalise successfully; garbage and
+    /// IP-literal-shaped hosts never pass.
+    pub fn allows(&self, host: &str) -> bool {
+        if !self.restrict {
+            normalize_domain(host).is_ok()
+        } else {
+            self.list.allows(host)
+        }
+    }
+}
+
 /// True if `ip` is a globally routable public address. Loopback, private,
 /// link-local, CGNAT, multicast, unique-local and reserved ranges are all
 /// rejected.
@@ -234,6 +276,21 @@ mod tests {
         assert!(!list.allows("google.com.evil.net"));
         assert!(!list.allows("notgoogle.com"));
         assert!(!list.allows(""));
+    }
+
+    #[test]
+    fn domain_policy_modes() {
+        let list = DomainList::new(["google.com"]).unwrap();
+        let unrestricted = DomainPolicy::unrestricted();
+        assert!(unrestricted.allows("anything.example"));
+        assert!(!unrestricted.allows("not a host"));
+
+        let restricted = DomainPolicy::restricted(list);
+        assert!(restricted.allows("google.com"));
+        assert!(!restricted.allows("other.example"));
+        // Toggling the same list changes the outcome.
+        let lenient = DomainPolicy::new(false, DomainList::new(["google.com"]).unwrap());
+        assert!(lenient.allows("other.example"));
     }
 
     #[test]

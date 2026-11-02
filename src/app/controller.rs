@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 use crate::app::commands::AppCommand;
 use crate::app::config::{self, Config, ValidatedConfig};
 use crate::app::state::{ProxyState, SharedAppState, StatusSnapshot};
-use crate::core::matcher::DomainList;
+use crate::core::matcher::{DomainList, DomainPolicy};
 use crate::core::server::{ProxyServer, ServerConfig, SharedDomains};
 
 pub struct Controller {
@@ -65,9 +65,10 @@ pub async fn start(path: PathBuf, stats: Arc<SharedAppState>) -> mpsc::Sender<Ap
         }
     };
 
-    let domains: SharedDomains = Arc::new(tokio::sync::RwLock::new(Arc::new(
+    let domains: SharedDomains = Arc::new(tokio::sync::RwLock::new(Arc::new(DomainPolicy::new(
+        validated.restrict_domains,
         DomainList::from_normalized(validated.domains.clone()),
-    )));
+    ))));
     let (enabled_tx, enabled_rx) = watch::channel(validated.enabled);
 
     let mut controller = Controller {
@@ -95,6 +96,7 @@ impl Controller {
             match cmd {
                 AppCommand::SetEnabled(on) => self.set_enabled(on).await,
                 AppCommand::UpdateDomains(domains) => self.update_domains(domains).await,
+                AppCommand::SetRestrictDomains(on) => self.set_restrict_domains(on).await,
                 AppCommand::ApplyAdvanced {
                     port,
                     max_connections,
@@ -135,12 +137,25 @@ impl Controller {
             }
         };
         let entries = normalized.sorted();
-        *self.domains.write().await = Arc::new(normalized);
+        *self.domains.write().await = Arc::new(DomainPolicy::new(
+            self.running.restrict_domains,
+            normalized,
+        ));
         self.running.domains = entries.clone();
         self.saved.domains = entries;
         self.notice = None;
         self.persist();
         info!("domain allowlist updated ({} entries)", self.running.domains.len());
+        self.publish();
+    }
+
+    async fn set_restrict_domains(&mut self, restrict: bool) {
+        self.running.restrict_domains = restrict;
+        self.saved.restrict_domains = restrict;
+        let list = DomainList::from_normalized(self.running.domains.clone());
+        *self.domains.write().await = Arc::new(DomainPolicy::new(restrict, list));
+        self.persist();
+        info!(restrict, "domain filter {}", if restrict { "restricted to allowlist" } else { "allowing all domains" });
         self.publish();
     }
 
@@ -247,6 +262,7 @@ impl Controller {
             tx_bytes: 0,
             rx_bytes: 0,
             domains: self.running.domains.clone(),
+            restrict_domains: self.running.restrict_domains,
             autostart: previous.autostart,
             show_on_startup: self.running.ui.show_on_startup,
             max_connections: self.running.max_connections,

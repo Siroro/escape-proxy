@@ -12,7 +12,7 @@ use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::matcher::{self, DomainList};
+use super::matcher::{self, DomainPolicy};
 use super::relay;
 use super::socks::{self, Address, Reply, SocksRequest};
 
@@ -35,10 +35,10 @@ impl Default for DestinationPolicy {
     }
 }
 
-/// The allowlist shared between the controller (writer) and sessions
+/// The domain policy shared between the controller (writer) and sessions
 /// (readers). Sessions clone the inner `Arc` per request, so updates are
 /// picked up by new requests without a listener restart.
-pub type SharedDomains = Arc<tokio::sync::RwLock<Arc<DomainList>>>;
+pub type SharedDomains = Arc<tokio::sync::RwLock<Arc<DomainPolicy>>>;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -345,9 +345,9 @@ impl Session {
         // the address policy.
         let candidates: Vec<SocketAddr> = match &request.address {
             Address::Domain(host) => {
-                let domains = self.domains.read().await.clone();
-                if !domains.allows(host) {
-                    debug!(host, "destination rejected by allowlist");
+                let policy = self.domains.read().await.clone();
+                if !policy.allows(host) {
+                    debug!(host, restrict = policy.restrict, "destination rejected by domain filter");
                     return Err(Reply::NotAllowed);
                 }
                 let addrs = match tokio::net::lookup_host((host.as_str(), request.port)).await {

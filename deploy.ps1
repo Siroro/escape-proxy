@@ -50,6 +50,7 @@ enabled = true
 max_connections = 128
 connect_timeout_ms = 5000
 handshake_timeout_ms = 5000
+restrict_domains = false
 domains = []
 
 [ui]
