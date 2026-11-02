@@ -1,0 +1,46 @@
+[package]
+name = "escape-proxy"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Lightweight Windows SOCKS5 proxy with a system tray and an FLTK settings GUI"
+repository = "https://github.com/Siroro/escape-proxy"
+build = "build.rs"
+
+[lib]
+name = "escape_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "escape-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "1"
+idna = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+fltk = "1.4"
+tray-icon = "0.19"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+strip = true
+lto = "thin"
