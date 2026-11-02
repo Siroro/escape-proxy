@@ -85,23 +85,10 @@ theme = "dark"
   the GUI reflects the actual registered state.
 - Set `ESCAPE_PROXY_HOME` to relocate config + logs (used by tests).
 
-## PIA + FoxyProxy setup
-
-1. Test escape-proxy on an alternate port first (Advanced settings), with a
-   temporary FoxyProxy rule pointing at it.
-2. In PIA, add the installed `escape-proxy.exe` as **Bypass VPN** (split
-   tunnel). Keep Brave as **Only VPN**.
-3. Point FoxyProxy patterns at `127.0.0.1:10808` for the sites that should
-   exit through the residential IP.
-4. Verify: matched sites show the residential public IP, unmatched sites the
-   PIA IP. Check DNS and IPv6 behaviour for each rule.
-5. Pause escape-proxy and confirm matched requests **fail** (no fallback).
-6. Stop 3proxy, disable its autostart, move escape-proxy to port 10808 and
-   verify the original rules still work.
 
 ## Architecture
 
-Four independent layers (see the design doc for the full specification):
+Four independent layers:
 
 | Layer | Location | Owns |
 |---|---|---|
