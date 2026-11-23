@@ -3,6 +3,7 @@
 //! config file directly.
 
 use fltk::browser::HoldBrowser;
+use fltk::enums::FrameType;
 use fltk::frame::Frame;
 use fltk::input::Input;
 use fltk::prelude::*;
@@ -55,12 +56,26 @@ pub fn remove_selected(
 
 pub fn refresh(browser: &mut HoldBrowser, domains: &[String]) {
     browser.clear();
+    if domains.is_empty() {
+        // Ghost row so the empty list reads as intentional. Selecting and
+        // removing it is a harmless no-op (`remove_selected` matches by
+        // text against the real allowlist).
+        browser.add("No domains configured");
+        return;
+    }
     for d in domains {
         browser.add(d);
     }
 }
 
 pub fn style_browser(browser: &mut HoldBrowser) {
-    browser.set_color(theme::INPUT_BG);
+    browser.set_frame(FrameType::RoundedBox);
+    browser.set_color(theme::LIST);
     browser.set_selection_color(theme::ACCENT);
+    // Item text uses the global foreground color (see theme::apply).
+    browser.set_text_size(13);
+    browser.set_scrollbar_size(10);
+    let mut sb = browser.scrollbar();
+    sb.set_color(theme::CARD);
+    sb.set_selection_color(theme::FIELD_EDGE);
 }

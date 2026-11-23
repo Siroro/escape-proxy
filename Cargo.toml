@@ -32,6 +32,7 @@ tray-icon = "0.19"
 version = "0.58"
 features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Security",
     "Win32_System_Registry",
     "Win32_System_Threading",

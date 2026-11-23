@@ -3,6 +3,7 @@
 use fltk::enums::Color;
 use fltk::frame::Frame;
 use fltk::prelude::*;
+use fltk::widget::Widget;
 
 use escape_proxy::app::state::{ProxyState, StatusSnapshot};
 
@@ -10,7 +11,7 @@ use crate::gui::theme;
 
 pub fn status_appearance(snapshot: &StatusSnapshot) -> (&'static str, Color) {
     match &snapshot.state {
-        ProxyState::Starting => ("Starting", theme::GRAY),
+        ProxyState::Starting => ("Starting", theme::AMBER),
         ProxyState::Running => ("Running", theme::GREEN),
         ProxyState::Paused => ("Paused", theme::GRAY),
         ProxyState::Error(_) => ("Error", theme::RED),
@@ -20,12 +21,13 @@ pub fn status_appearance(snapshot: &StatusSnapshot) -> (&'static str, Color) {
 /// Refreshes the status badge and the transient error line. Values are only
 /// touched when they actually changed — unconditional `set_label` calls
 /// would mark the window damaged on every tick and keep the FLTK loop from
-/// sleeping.
-pub fn refresh_status(badge: &mut Frame, error_label: &mut Frame, snapshot: &StatusSnapshot) {
+/// sleeping. The badge draws its own status dot in `label_color` (see
+/// `widgets::style_badge`), so the label carries the word only.
+pub fn refresh_status(badge: &mut Widget, error_label: &mut Frame, snapshot: &StatusSnapshot) {
     let (text, color) = status_appearance(snapshot);
-    let badge_label = format!("\u{25cf} {text}");
-    if badge.label() != badge_label {
-        badge.set_label(&badge_label);
+    if badge.label() != text {
+        badge.set_label(text);
+        badge.redraw();
     }
     if badge.label_color() != color {
         badge.set_label_color(color);

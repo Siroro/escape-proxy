@@ -1,11 +1,31 @@
 # escape-proxy
 
-A lightweight Windows SOCKS5 proxy 
+A lightweight Windows SOCKS5 proxy with a system tray icon and a small
+FLTK settings window. It replaces a plain `allow *` 3proxy setup with an
+**allowlisted** proxy that forwards approved browser traffic directly through
+the residential internet connection while everything else stays on the VPN.
+
+```text
+Brave (PIA: Only VPN)
+   |
+   v
+FoxyProxy ------------------ matched site --> 127.0.0.1:10808 --> escape-proxy.exe
+   |                                                            (PIA: Bypass VPN)
+   +---------------------------- unmatched site --> PIA VPN --> Internet
+```
+
+**One process, one executable. No external proxy, no embedded browser, no
+background services.**
 
 ## Features
 
 - SOCKS5 (RFC 1928): no-auth, TCP CONNECT only; BIND and UDP ASSOCIATE are
   rejected.
+- **All domains are allowed by default** (matching the old `allow *` 3proxy
+  behaviour). Optionally enable **Restrict to listed domains** in the settings
+  window to limit forwarding to a domain allowlist with IDNA (punycode)
+  normalisation and dot-guarded subdomain matching (`sub.google.com` matches
+  `google.com`; `evilgoogle.com` never does).
 - Strict address policy either way: literal-IP requests are rejected,
   hostnames are resolved via system DNS, and only public routable addresses
   are connected (loopback/private/CGNAT/link-local/reserved ranges are
@@ -57,7 +77,7 @@ theme = "dark"
 
 - The bind IP is fixed at `127.0.0.1`; only the port is configurable.
 - `restrict_domains = false` (default): every valid hostname is forwarded.
-  Set it to `true` (or toggle **Restrict to list** in the GUI) to allow only
+  Set it to `true` (or toggle **Restrict to listed domains** in the GUI) to allow only
   the entries in `domains`.
 - Changes made in the settings window apply immediately and are saved
   atomically (write-temp-then-rename); there is no file watcher.
@@ -65,10 +85,23 @@ theme = "dark"
   the GUI reflects the actual registered state.
 - Set `ESCAPE_PROXY_HOME` to relocate config + logs (used by tests).
 
+## PIA + FoxyProxy setup
+
+1. Test escape-proxy on an alternate port first (Advanced settings), with a
+   temporary FoxyProxy rule pointing at it.
+2. In PIA, add the installed `escape-proxy.exe` as **Bypass VPN** (split
+   tunnel). Keep Brave as **Only VPN**.
+3. Point FoxyProxy patterns at `127.0.0.1:10808` for the sites that should
+   exit through the residential IP.
+4. Verify: matched sites show the residential public IP, unmatched sites the
+   PIA IP. Check DNS and IPv6 behaviour for each rule.
+5. Pause escape-proxy and confirm matched requests **fail** (no fallback).
+6. Stop 3proxy, disable its autostart, move escape-proxy to port 10808 and
+   verify the original rules still work.
 
 ## Architecture
 
-Four independent layers:
+Four independent layers (see the design doc for the full specification):
 
 | Layer | Location | Owns |
 |---|---|---|
@@ -100,3 +133,14 @@ cargo build --release
 Test policy knobs (`DestinationPolicy { allow_ip_literals, allow_private_ips }`)
 exist for the integration tests; production defaults are strict.
 
+## Security notes
+
+- The proxy listens on loopback only.
+- By default **all domains** are forwarded (like the 3proxy setup this
+  replaces). Enable **Restrict to listed domains** for an allowlist posture.
+- Either way, the address policy still blocks literal-IP requests and any
+  destination that resolves to a non-public address, so a browser pattern
+  cannot reach LAN/internal hosts through this proxy.
+- Logs record lifecycle, listener failures, config changes and refused
+  destinations — not browsing histories or payloads.
+- No telemetry, no updates, no web dashboard.
