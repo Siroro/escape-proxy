@@ -265,20 +265,25 @@ impl Session {
 
     async fn handle(&self, socket: &mut TcpStream) {
         socket.set_nodelay(true).ok();
-        let outcome = tokio::time::timeout(self.cfg.handshake_timeout, self.handshake(socket)).await;
-        match outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(_rejected)) => {} // handshake already replied and counted
-            Err(_) => {
-                debug!("handshake timeout");
-                self.stats.rejected.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        // The deadline bounds the SOCKS5 negotiation only. An established
+        // relay (WebSocket, SSE, a long download) legitimately stays open far
+        // longer, so it must run outside this timeout.
+        let request =
+            match tokio::time::timeout(self.cfg.handshake_timeout, self.negotiate(socket)).await {
+                Ok(Ok(request)) => request,
+                Ok(Err(_rejected)) => return, // handshake already replied and counted
+                Err(_) => {
+                    debug!("handshake timeout");
+                    self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+        self.forward(socket, request).await;
     }
 
-    /// Performs the handshake + relay. `Ok(())` means the session ended
-    /// normally; `Err(())` marks a rejected request (already accounted).
-    async fn handshake(&self, socket: &mut TcpStream) -> Result<(), ()> {
+    /// Reads the greeting and the CONNECT request. `Err(())` marks a rejected
+    /// handshake (already replied and counted).
+    async fn negotiate(&self, socket: &mut TcpStream) -> Result<SocksRequest, ()> {
         let methods = match socks::read_greeting(socket).await {
             Ok(m) => m,
             Err(e) => {
@@ -311,7 +316,11 @@ impl Session {
                 return Err(());
             }
         };
+        Ok(request)
+    }
 
+    /// Connects to the destination, then relays until both sides close.
+    async fn forward(&self, socket: &mut TcpStream, request: SocksRequest) {
         match self.connect_destination(&request).await {
             Ok(mut remote) => {
                 let _ = socket.write_all(&socks::success_reply()).await;
@@ -335,7 +344,6 @@ impl Session {
                 warn!(dest = %destination_label(&request), reply = reply as u8, "destination refused");
             }
         }
-        Ok(())
     }
 
     /// Validates the destination against policy, resolves it and establishes

@@ -49,15 +49,15 @@ async fn start_proxy(domains: &[&str], max_connections: usize) -> TestProxy {
 }
 
 async fn start_proxy_with_policy(policy: DomainPolicy, max_connections: usize) -> TestProxy {
+    start_proxy_with(test_config("127.0.0.1:0".parse().unwrap(), max_connections), policy).await
+}
+
+async fn start_proxy_with(cfg: ServerConfig, policy: DomainPolicy) -> TestProxy {
     let shared: SharedDomains = Arc::new(tokio::sync::RwLock::new(Arc::new(policy)));
     let (enabled_tx, enabled_rx) = tokio::sync::watch::channel(true);
-    let server = ProxyServer::start(
-        test_config("127.0.0.1:0".parse().unwrap(), max_connections),
-        shared.clone(),
-        enabled_rx,
-    )
-    .await
-    .unwrap();
+    let server = ProxyServer::start(cfg, shared.clone(), enabled_rx)
+        .await
+        .unwrap();
     TestProxy {
         addr: server.local_addr,
         server,
@@ -355,6 +355,53 @@ async fn pausing_rejects_new_sessions_and_closes_relays() {
     let (c3, r3) = socks_connect(proxy.addr, "localhost", echo.port()).await.unwrap();
     assert_eq!(r3[1], 0);
     drop(c3);
+    proxy.server.shutdown().await;
+}
+
+/// Proxy restricted to `localhost` with a short handshake deadline.
+async fn start_proxy_with_handshake_timeout(handshake_timeout: Duration) -> TestProxy {
+    let mut cfg = test_config("127.0.0.1:0".parse().unwrap(), 16);
+    cfg.handshake_timeout = handshake_timeout;
+    start_proxy_with(
+        cfg,
+        DomainPolicy::restricted(DomainList::new(["localhost"]).unwrap()),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn silent_client_is_dropped_after_handshake_timeout() {
+    let proxy = start_proxy_with_handshake_timeout(Duration::from_millis(200)).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+
+    // No greeting is ever sent: the proxy must give up once the deadline
+    // passes (reset is as good as a clean close).
+    let mut buf = [0u8; 2];
+    match tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!("proxy replied {n} bytes to a client that sent nothing"),
+        Ok(Err(e)) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset) => {}
+        Ok(Err(e)) => panic!("unexpected read error: {e}"),
+        Err(_) => panic!("silent client was not dropped after the handshake timeout"),
+    }
+    proxy.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn relay_outlives_the_handshake_timeout() {
+    let echo = spawn_echo().await;
+    let proxy = start_proxy_with_handshake_timeout(Duration::from_millis(200)).await;
+    let (mut client, reply) = socks_connect(proxy.addr, "localhost", echo.port()).await.unwrap();
+    assert_eq!(reply[1], 0);
+
+    // Well past the handshake deadline: an established relay must keep
+    // working, since WebSockets, SSE streams and long downloads stay open
+    // far longer than a handshake.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    client.write_all(b"still open").await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"still open");
     proxy.server.shutdown().await;
 }
 
