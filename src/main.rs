@@ -39,7 +39,7 @@ fn ui_tick(handle: fltk::app::TimeoutHandle) {
         if let Some((state, window)) = borrowed.as_ref() {
             let visible = window.borrow().win.visible();
             if visible {
-                window.borrow_mut().tick(state, false);
+                window.borrow_mut().tick(state);
             }
         }
     });
@@ -48,13 +48,21 @@ fn ui_tick(handle: fltk::app::TimeoutHandle) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let launch_hidden = args.iter().any(|a| a == "--background");
+    // Asks a running instance to quit (deploy.ps1 uses this instead of a kill).
+    let exit_running = args.iter().any(|a| a == "--exit");
 
     // --- single instance ----------------------------------------------------
-    let _instance = match instance::SingleInstance::try_acquire() {
+    let second_launch = if exit_running {
+        instance::SecondLaunch::Exit
+    } else {
+        instance::SecondLaunch::ShowSettings
+    };
+    let _instance = match instance::SingleInstance::try_acquire(second_launch) {
+        // Nothing is running, so there is nothing for `--exit` to do.
+        Ok(Some(_guard)) if exit_running => return,
         Ok(Some(guard)) => guard,
         Ok(None) => {
-            // Second launch: the running instance has been asked to show its
-            // settings window.
+            // Second launch: the running instance has been signalled.
             return;
         }
         Err(e) => {
@@ -106,12 +114,20 @@ fn main() {
     state.set_wake_gui(Box::new(|| fltk::app::awake()));
 
     // --- tray -------------------------------------------------------------------
-    let tray_thread = match instance::create_activation_event() {
-        Ok(activate_event) => {
-            tray::spawn(state.clone(), cmd_tx.clone(), activate_event, logs_dir.clone()).ok()
-        }
+    let tray_events = instance::create_activation_event().and_then(|activate| {
+        instance::create_exit_event().map(|exit| (activate, exit))
+    });
+    let tray_thread = match tray_events {
+        Ok((activate_event, exit_event)) => tray::spawn(
+            state.clone(),
+            cmd_tx.clone(),
+            activate_event,
+            exit_event,
+            logs_dir.clone(),
+        )
+        .ok(),
         Err(e) => {
-            tracing::error!("activation event unavailable: {e}");
+            tracing::error!("tray events unavailable: {e}");
             None
         }
     };
@@ -135,11 +151,11 @@ fn main() {
         let mut exit = false;
         for event in state.take_events() {
             match event {
-                GuiEvent::ShowSettings => window.borrow_mut().show_window(),
+                GuiEvent::ShowSettings => window.borrow_mut().show_window(&state),
                 GuiEvent::StatusChanged => {
                     let visible = window.borrow().win.visible();
                     if visible {
-                        window.borrow_mut().tick(&state, true);
+                        window.borrow_mut().tick(&state);
                     }
                 }
                 GuiEvent::AutostartChanged(_) => {
@@ -166,5 +182,8 @@ fn main() {
     if let Some(handle) = tray_thread {
         let _ = handle.join();
     }
+    // `process::exit` runs no destructors, so the log writer must be dropped
+    // here or its final lines are lost.
+    drop(_log_guard);
     std::process::exit(0);
 }

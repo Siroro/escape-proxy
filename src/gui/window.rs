@@ -18,7 +18,7 @@ use fltk::window::Window;
 use tokio::sync::mpsc;
 
 use escape_proxy::app::commands::AppCommand;
-use escape_proxy::app::state::{ProxyState, SharedAppState};
+use escape_proxy::app::state::{ProxyState, SharedAppState, StatusSnapshot};
 use escape_proxy::app::statistics::format_bytes;
 use escape_proxy::platform::windows;
 
@@ -75,6 +75,21 @@ const MAX_H: i32 = 900;
 const HINT_RESTRICTED: &str = "Only the listed domains and their subdomains are proxied.";
 const HINT_UNRESTRICTED: &str = "All domains are proxied; the list is used only when restricted.";
 
+// ---------------------------------------------------------- advanced form
+
+/// The port part of a listen address (`127.0.0.1:10808` gives `10808`).
+fn port_text(snap: &StatusSnapshot) -> String {
+    snap.listen_addr.rsplit(':').next().unwrap_or("").to_string()
+}
+
+/// Identifies the advanced settings last loaded into the form.
+fn advanced_signature(snap: &StatusSnapshot) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}",
+        snap.listen_addr, snap.max_connections, snap.connect_timeout_ms
+    )
+}
+
 pub struct MainWindow {
     pub win: Window,
     status_badge: Widget,
@@ -91,6 +106,7 @@ pub struct MainWindow {
     maxconn_input: IntInput,
     timeout_input: IntInput,
     domains_sig: String,
+    advanced_sig: String,
 }
 
 // -------------------------------------------------------------- row helpers
@@ -367,9 +383,15 @@ pub fn build(
     let mut adv_body = Flex::default().column();
     adv_body.set_spacing(ROW_GAP);
 
-    let port_input = input_row(&mut adv_body, "Listening port", "10808");
-    let maxconn_input = input_row(&mut adv_body, "Max connections", "128");
-    let timeout_input = input_row(&mut adv_body, "Connect timeout (ms)", "5000");
+    // Seed the form from the effective settings. Hard-coded defaults would
+    // misreport a customised config until the first status event, and Apply
+    // would then write them.
+    let initial = state.snapshot();
+    let port_input = input_row(&mut adv_body, "Listening port", &port_text(&initial));
+    let maxconn_input =
+        input_row(&mut adv_body, "Max connections", &initial.max_connections.to_string());
+    let timeout_input =
+        input_row(&mut adv_body, "Connect timeout (ms)", &initial.connect_timeout_ms.to_string());
 
     let mut apply_row = row(&mut adv_body, APPLY_ROW_H);
     let advanced_error = error_frame();
@@ -490,6 +512,7 @@ pub fn build(
         // Sentinel that never matches a real signature, so the first tick
         // populates the browser (including its empty-list placeholder).
         domains_sig: String::from("\u{1}uninitialized"),
+        advanced_sig: advanced_signature(&initial),
     }
 }
 
@@ -505,15 +528,18 @@ fn dark_titlebar(win: &Window) {
 }
 
 impl MainWindow {
-    pub fn show_window(&mut self) {
+    pub fn show_window(&mut self, state: &SharedAppState) {
         self.win.show();
         // The HWND only exists once shown; the dark title bar needs it.
         dark_titlebar(&self.win);
+        // Refresh now rather than on the next periodic tick.
+        self.tick(state);
     }
 
-    /// Refreshes dynamic widgets. Called from the main loop only while the
-    /// window is visible (plus once on status-change events).
-    pub fn tick(&mut self, state: &SharedAppState, config_changed: bool) {
+    /// Refreshes dynamic widgets. Called from the main loop while the window
+    /// is visible (periodic tick and status-change events) and when it is
+    /// shown.
+    pub fn tick(&mut self, state: &SharedAppState) {
         let snap = state.live_snapshot();
         overview::refresh_status(&mut self.status_badge, &mut self.error_label, &snap);
 
@@ -565,9 +591,12 @@ impl MainWindow {
             self.startup_switch.set_value(snap.show_on_startup);
             self.startup_switch.redraw();
         }
-        if config_changed {
-            let port = snap.listen_addr.rsplit(':').next().unwrap_or("").to_string();
-            self.port_input.set_value(&port);
+        // Reload the form only when the effective settings changed, so values
+        // typed but not applied yet survive other status updates.
+        let sig = advanced_signature(&snap);
+        if sig != self.advanced_sig {
+            self.advanced_sig = sig;
+            self.port_input.set_value(&port_text(&snap));
             self.maxconn_input.set_value(&snap.max_connections.to_string());
             self.timeout_input.set_value(&snap.connect_timeout_ms.to_string());
         }

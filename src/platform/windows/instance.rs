@@ -8,6 +8,17 @@ use windows::Win32::System::Threading::{
 
 const MUTEX_NAME: PCWSTR = w!("Local\\escape-proxy-single-instance");
 const ACTIVATE_EVENT_NAME: PCWSTR = w!("Local\\escape-proxy-activate");
+const EXIT_EVENT_NAME: PCWSTR = w!("Local\\escape-proxy-exit");
+
+/// What a second launch asks the running instance to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondLaunch {
+    /// Bring the settings window up (the default when the app is opened
+    /// again).
+    ShowSettings,
+    /// Shut down (`escape-proxy --exit`).
+    Exit,
+}
 
 /// A raw handle wrapped for transfer to another thread. Safe because the
 /// Windows object APIs used here are thread-agnostic.
@@ -35,14 +46,20 @@ pub struct SingleInstance {
 impl SingleInstance {
     /// Attempts to become the single instance for this user session.
     /// Returns `Ok(Some(guard))` for the first instance. For a second
-    /// instance, signals the first to show its settings window and returns
-    /// `Ok(None)`.
-    pub fn try_acquire() -> windows::core::Result<Option<SingleInstance>> {
+    /// instance, signals the first as requested by `second_launch` and
+    /// returns `Ok(None)`.
+    pub fn try_acquire(
+        second_launch: SecondLaunch,
+    ) -> windows::core::Result<Option<SingleInstance>> {
         unsafe {
             let mutex = CreateMutexW(None, false, MUTEX_NAME)?;
             if GetLastError() == windows::Win32::Foundation::ERROR_ALREADY_EXISTS {
                 let _ = CloseHandle(mutex);
-                activate_first_instance()?;
+                let event = match second_launch {
+                    SecondLaunch::ShowSettings => ACTIVATE_EVENT_NAME,
+                    SecondLaunch::Exit => EXIT_EVENT_NAME,
+                };
+                signal_first_instance(event)?;
                 return Ok(None);
             }
             Ok(Some(SingleInstance {
@@ -60,8 +77,17 @@ impl Drop for SingleInstance {
 
 /// Signals the running instance to bring its settings window up.
 pub fn activate_first_instance() -> windows::core::Result<()> {
+    signal_first_instance(ACTIVATE_EVENT_NAME)
+}
+
+/// Signals the running instance to shut down (`escape-proxy --exit`).
+pub fn exit_first_instance() -> windows::core::Result<()> {
+    signal_first_instance(EXIT_EVENT_NAME)
+}
+
+fn signal_first_instance(event: PCWSTR) -> windows::core::Result<()> {
     unsafe {
-        let event = OpenEventW(EVENT_MODIFY_STATE, false, ACTIVATE_EVENT_NAME)?;
+        let event = OpenEventW(EVENT_MODIFY_STATE, false, event)?;
         SetEvent(event)?;
         let _ = CloseHandle(event);
         Ok(())
@@ -71,4 +97,9 @@ pub fn activate_first_instance() -> windows::core::Result<()> {
 /// Creates the named activation event the tray message loop waits on.
 pub fn create_activation_event() -> windows::core::Result<SendHandle> {
     unsafe { Ok(SendHandle(CreateEventW(None, false, false, ACTIVATE_EVENT_NAME)?)) }
+}
+
+/// Creates the named exit event the tray message loop waits on.
+pub fn create_exit_event() -> windows::core::Result<SendHandle> {
+    unsafe { Ok(SendHandle(CreateEventW(None, false, false, EXIT_EVENT_NAME)?)) }
 }

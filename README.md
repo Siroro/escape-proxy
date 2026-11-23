@@ -39,6 +39,8 @@ background services.**
 - Windows integration: HKCU Run-key autostart (`--background`), named-mutex
   single instance with second-launch window activation, embedded icon and
   version metadata, rotating daily logs (7 kept).
+- `escape-proxy --exit` asks the running instance to quit (same single-instance
+  channel); with nothing running it does nothing.
 
 ## Install
 
@@ -53,7 +55,8 @@ cd escape-proxy
 `deploy.ps1` builds the release binary, installs to
 `%LOCALAPPDATA%\escape-proxy\` (`escape-proxy.exe`, `config.toml`, `logs\`),
 registers autostart and starts the app. Use `-NoAutostart` to skip the
-autostart registration.
+autostart registration. A running instance is asked to exit with `--exit`
+first and force-stopped only if it is still there after five seconds.
 
 ## Configuration
 
@@ -81,6 +84,9 @@ theme = "dark"
   the entries in `domains`.
 - Changes made in the settings window apply immediately and are saved
   atomically (write-temp-then-rename); there is no file watcher.
+- A setting that fails validation is reset to its default and reported in the
+  settings window; every other setting in the file is kept. A file that cannot
+  be parsed at all is copied to `config.toml.bak` before it is replaced.
 - Autostart state lives in the registry (`HKCU\...\Run`), not in the config;
   the GUI reflects the actual registered state.
 - Set `ESCAPE_PROXY_HOME` to relocate config + logs (used by tests).

@@ -14,7 +14,7 @@ use crate::app::commands::AppCommand;
 use crate::app::config::{self, Config, ValidatedConfig};
 use crate::app::state::{ProxyState, SharedAppState, StatusSnapshot};
 use crate::core::matcher::{DomainList, DomainPolicy};
-use crate::core::server::{ProxyServer, ServerConfig, SharedDomains};
+use crate::core::server::{ProxyServer, ServerConfig, ServerStats, SharedDomains};
 
 pub struct Controller {
     path: PathBuf,
@@ -23,11 +23,14 @@ pub struct Controller {
     /// Currently applied runtime settings.
     running: ValidatedConfig,
     domains: SharedDomains,
+    /// Traffic counters, shared by every listener so totals survive a rebind.
+    server_stats: Arc<ServerStats>,
     enabled_tx: watch::Sender<bool>,
     server: Option<Arc<ProxyServer>>,
-    /// Listener failure text while `server` is `None`.
+    /// Why the listener is down, while `server` is `None`.
     listener_error: Option<String>,
-    /// Transient notice (config load/apply problems) surfaced in the GUI.
+    /// Transient notice (config load/validation/apply problems) surfaced in
+    /// the GUI.
     notice: Option<String>,
     stats: Arc<SharedAppState>,
     cmd_rx: mpsc::Receiver<AppCommand>,
@@ -38,17 +41,26 @@ pub struct Controller {
 pub async fn start(path: PathBuf, stats: Arc<SharedAppState>) -> mpsc::Sender<AppCommand> {
     let (tx, rx) = mpsc::channel(32);
 
-    let (mut saved_config, load_error) = match config::load(&path) {
+    let (mut saved_config, mut notice) = match config::load(&path) {
         Ok(c) => (c, None),
         Err(e) => {
-            let msg = format!("config load failed: {e}; using defaults");
+            // Defaults are what will be saved over the file in the end; keep
+            // a copy of what could not be read so nothing is lost.
+            let preserved = match config::backup(&path) {
+                Ok(copy) => format!("; the original was copied to {}", copy.display()),
+                Err(err) => {
+                    warn!("cannot back up the unreadable config: {err}");
+                    String::new()
+                }
+            };
+            let msg = format!("config load failed: {e}{preserved}; using defaults");
             warn!("{msg}");
             (Config::default(), Some(msg))
         }
     };
     // Persist defaults immediately when no config exists yet so the file is
     // discoverable next to the executable's data directory.
-    if load_error.is_none() && !path.exists() {
+    if notice.is_none() && !path.exists() {
         if let Err(e) = config::save(&path, &saved_config) {
             warn!("cannot write initial config: {e}");
         }
@@ -56,12 +68,18 @@ pub async fn start(path: PathBuf, stats: Arc<SharedAppState>) -> mpsc::Sender<Ap
 
     let validated = match saved_config.validate() {
         Ok(v) => v,
-        Err(e) => {
-            let msg = format!("config invalid: {e}; using defaults");
+        Err(_) => {
+            // Repair only what is invalid: one bad value must not discard the
+            // user's other settings.
+            let (repaired, problems) = saved_config.repair();
+            let msg = format!("config invalid: {}; those settings use defaults", problems.join("; "));
             warn!("{msg}");
-            saved_config = Config::default();
-            let _ = saved_config.validate().expect("defaults must validate");
-            saved_config.validate().unwrap()
+            saved_config = repaired;
+            notice = Some(match notice {
+                Some(earlier) => format!("{earlier}; {msg}"),
+                None => msg,
+            });
+            saved_config.validate().expect("repaired config must validate")
         }
     };
 
@@ -71,15 +89,20 @@ pub async fn start(path: PathBuf, stats: Arc<SharedAppState>) -> mpsc::Sender<Ap
     ))));
     let (enabled_tx, enabled_rx) = watch::channel(validated.enabled);
 
+    // One set of counters serves every listener, so totals survive a rebind.
+    let server_stats = Arc::new(ServerStats::default());
+    stats.set_stats_source(server_stats.clone());
+
     let mut controller = Controller {
         path,
         saved: saved_config,
         running: validated,
         domains,
+        server_stats,
         enabled_tx,
         server: None,
         listener_error: None,
-        notice: load_error,
+        notice,
         stats,
         cmd_rx: rx,
     };
@@ -177,19 +200,41 @@ impl Controller {
 
         // Stop the old listener first so a rebind to the same port cannot
         // collide with itself.
+        let had_server = self.server.is_some();
+        let previous = (
+            self.running.listen,
+            self.running.max_connections,
+            self.running.connect_timeout,
+        );
         self.stop_server().await;
         self.running.listen = validated.listen;
         self.running.max_connections = validated.max_connections;
         self.running.connect_timeout = validated.connect_timeout;
         self.start_server(None).await;
 
-        if self.server.is_some() {
-            self.saved.listen_addr = validated.listen.to_string();
-            self.saved.max_connections = validated.max_connections;
-            self.saved.connect_timeout_ms = validated.connect_timeout.as_millis() as u64;
-            self.notice = None;
-            self.persist();
+        if self.server.is_none() {
+            // The new settings could not be applied (typically the port is
+            // already in use). Put the previous settings back and bring the
+            // old listener up again rather than leave the proxy down.
+            let reason = self.listener_error.clone().unwrap_or_default();
+            (self.running.listen, self.running.max_connections, self.running.connect_timeout) =
+                previous;
+            if had_server {
+                self.start_server(None).await;
+            }
+            self.notice = Some(format!(
+                "cannot listen on {}: {}; keeping {}",
+                validated.listen, reason, previous.0
+            ));
+            self.publish();
+            return;
         }
+
+        self.saved.listen_addr = validated.listen.to_string();
+        self.saved.max_connections = validated.max_connections;
+        self.saved.connect_timeout_ms = validated.connect_timeout.as_millis() as u64;
+        self.notice = None;
+        self.persist();
         self.publish();
     }
 
@@ -209,26 +254,31 @@ impl Controller {
             policy: Default::default(),
         };
         let enabled_rx = enabled_rx.unwrap_or_else(|| self.enabled_tx.subscribe());
-        match ProxyServer::start(server_config, self.domains.clone(), enabled_rx).await {
+        match ProxyServer::start(
+            server_config,
+            self.domains.clone(),
+            enabled_rx,
+            self.server_stats.clone(),
+        )
+        .await
+        {
             Ok(server) => {
-                self.stats.set_stats_source(Some(server.stats.clone()));
                 info!(addr = %server.local_addr, "listener started");
                 self.server = Some(server);
                 self.listener_error = None;
             }
             Err(e) => {
                 error!("listener failed to start: {e}");
-                self.stats.set_stats_source(None);
                 self.server = None;
-                self.listener_error = Some(format!("listener failed: {e}"));
+                self.listener_error = Some(e.to_string());
             }
         }
     }
 
+    /// Stops the listener if one is running.
     async fn stop_server(&mut self) {
         if let Some(server) = self.server.take() {
             server.shutdown().await;
-            self.stats.set_stats_source(None);
         }
     }
 
@@ -240,7 +290,7 @@ impl Controller {
 
     fn current_state(&self) -> ProxyState {
         if let Some(err) = &self.listener_error {
-            return ProxyState::Error(err.clone());
+            return ProxyState::Error(format!("listener failed: {err}"));
         }
         if self.server.is_none() {
             return ProxyState::Error("listener not running".to_string());

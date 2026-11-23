@@ -126,24 +126,32 @@ pub struct ValidatedConfig {
     pub ui: UiConfig,
 }
 
+/// Parses `addr` if it is a loopback listen address (`127.0.0.1:port`).
+fn parse_loopback_listen(addr: &str) -> Option<SocketAddr> {
+    addr.parse::<SocketAddr>().ok().filter(|a| a.ip().is_loopback())
+}
+
+fn is_valid_max_connections(n: usize) -> bool {
+    n > 0 && n <= MAX_CONNECTIONS_LIMIT
+}
+
+fn is_valid_timeout(ms: u64) -> bool {
+    (MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&ms)
+}
+
 impl Config {
     /// Validates the configuration. Port 0 is accepted and means "ephemeral"
     /// (used by tests); the GUI always writes a concrete port.
     pub fn validate(&self) -> Result<ValidatedConfig, ConfigError> {
-        let listen: SocketAddr = self
-            .listen_addr
-            .parse()
-            .map_err(|_| ConfigError::BindIpNotAllowed(self.listen_addr.clone()))?;
-        if !listen.ip().is_loopback() {
-            return Err(ConfigError::BindIpNotAllowed(self.listen_addr.clone()));
-        }
-        if self.max_connections == 0 || self.max_connections > MAX_CONNECTIONS_LIMIT {
+        let listen: SocketAddr = parse_loopback_listen(&self.listen_addr)
+            .ok_or_else(|| ConfigError::BindIpNotAllowed(self.listen_addr.clone()))?;
+        if !is_valid_max_connections(self.max_connections) {
             return Err(ConfigError::InvalidMaxConnections(self.max_connections));
         }
-        if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&self.connect_timeout_ms) {
+        if !is_valid_timeout(self.connect_timeout_ms) {
             return Err(ConfigError::InvalidTimeout(self.connect_timeout_ms));
         }
-        if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&self.handshake_timeout_ms) {
+        if !is_valid_timeout(self.handshake_timeout_ms) {
             return Err(ConfigError::InvalidTimeout(self.handshake_timeout_ms));
         }
         let mut set = std::collections::BTreeSet::new();
@@ -160,6 +168,53 @@ impl Config {
             restrict_domains: self.restrict_domains,
             ui: self.ui.clone(),
         })
+    }
+
+    /// A copy with every invalid setting replaced by its default, together
+    /// with one message per replaced setting. Unlike [`Config::validate`]
+    /// this keeps everything that is valid, so a single bad value in a
+    /// hand-edited file costs only that setting. The result always validates.
+    pub fn repair(&self) -> (Config, Vec<String>) {
+        let defaults = Config::default();
+        let mut cfg = self.clone();
+        let mut problems = Vec::new();
+        if parse_loopback_listen(&cfg.listen_addr).is_none() {
+            problems.push(format!(
+                "listen_addr '{}' reset to '{}'",
+                cfg.listen_addr, defaults.listen_addr
+            ));
+            cfg.listen_addr = defaults.listen_addr.clone();
+        }
+        if !is_valid_max_connections(cfg.max_connections) {
+            problems.push(format!(
+                "max_connections {} reset to {}",
+                cfg.max_connections, defaults.max_connections
+            ));
+            cfg.max_connections = defaults.max_connections;
+        }
+        if !is_valid_timeout(cfg.connect_timeout_ms) {
+            problems.push(format!(
+                "connect_timeout_ms {} reset to {}",
+                cfg.connect_timeout_ms, defaults.connect_timeout_ms
+            ));
+            cfg.connect_timeout_ms = defaults.connect_timeout_ms;
+        }
+        if !is_valid_timeout(cfg.handshake_timeout_ms) {
+            problems.push(format!(
+                "handshake_timeout_ms {} reset to {}",
+                cfg.handshake_timeout_ms, defaults.handshake_timeout_ms
+            ));
+            cfg.handshake_timeout_ms = defaults.handshake_timeout_ms;
+        }
+        let mut domains = Vec::new();
+        for domain in &cfg.domains {
+            match matcher::normalize_domain(domain) {
+                Ok(normalised) => domains.push(normalised),
+                Err(e) => problems.push(e.to_string()),
+            }
+        }
+        cfg.domains = domains;
+        (cfg, problems)
     }
 
     pub fn from_validated(v: &ValidatedConfig) -> Self {
@@ -216,4 +271,12 @@ pub fn save(path: &Path, cfg: &Config) -> Result<(), ConfigError> {
             Err(e.into())
         }
     }
+}
+
+/// Copies an unreadable config to `config.toml.bak` before anything is saved
+/// over it, so the settings in it stay recoverable. Returns the copy's path.
+pub fn backup(path: &Path) -> std::io::Result<PathBuf> {
+    let backup = path.with_extension("toml.bak");
+    std::fs::copy(path, &backup)?;
+    Ok(backup)
 }

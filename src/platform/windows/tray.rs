@@ -47,11 +47,17 @@ const YELLOW: (u8, u8, u8) = (255, 193, 7);
 const RED: (u8, u8, u8) = (233, 84, 84);
 const ICON_SIZE: u32 = 32;
 
-enum TrayStatus {
-    Running,
-    Paused,
-    Warning,
-    Error,
+/// Everything the icon and the menu show. Compared every iteration, so the
+/// native calls happen only when something the user can see changed.
+#[derive(Debug, PartialEq)]
+struct TrayView {
+    status: String,
+    color: (u8, u8, u8),
+    connections: u64,
+    /// Whether "Enabled" is checked: the proxy is up and forwarding.
+    enabled: bool,
+    autostart: bool,
+    listen_addr: String,
 }
 
 fn now_ms() -> u64 {
@@ -61,19 +67,26 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn tray_status(snapshot: &StatusSnapshot) -> TrayStatus {
-    match &snapshot.state {
-        ProxyState::Error(_) => TrayStatus::Error,
-        ProxyState::Paused => TrayStatus::Paused,
-        ProxyState::Starting | ProxyState::Running => {
-            if snapshot.last_failure_ms > 0
-                && now_ms().saturating_sub(snapshot.last_failure_ms) < WARNING_WINDOW_MS
-            {
-                TrayStatus::Warning
-            } else {
-                TrayStatus::Running
-            }
+fn tray_view(snapshot: &StatusSnapshot, now_ms: u64) -> TrayView {
+    // Up and running, but a destination failed just now: flag it without
+    // hiding that the proxy itself is healthy.
+    let recent_failure = snapshot.last_failure_ms > 0
+        && now_ms.saturating_sub(snapshot.last_failure_ms) < WARNING_WINDOW_MS;
+    let (status, color) = match &snapshot.state {
+        ProxyState::Error(e) => (format!("\u{25cf} Error: {e}"), RED),
+        ProxyState::Paused => ("\u{25cf} Paused".to_string(), GRAY),
+        ProxyState::Starting | ProxyState::Running if recent_failure => {
+            ("\u{25cf} Warning".to_string(), YELLOW)
         }
+        ProxyState::Starting | ProxyState::Running => ("\u{25cf} Running".to_string(), GREEN),
+    };
+    TrayView {
+        status,
+        color,
+        connections: snapshot.active_connections,
+        enabled: matches!(snapshot.state, ProxyState::Starting | ProxyState::Running),
+        autostart: snapshot.autostart,
+        listen_addr: snapshot.listen_addr.clone(),
     }
 }
 
@@ -117,18 +130,24 @@ fn make_icon(color: (u8, u8, u8)) -> Result<Icon, Box<dyn std::error::Error>> {
 }
 
 /// Spawns the tray thread. `activate_event` is the named event a second
-/// launch signals to show the settings window.
+/// launch signals to show the settings window; `exit_event` is the one
+/// `escape-proxy --exit` signals to shut the app down.
 pub fn spawn(
     state: Arc<SharedAppState>,
     cmd_tx: tokio::sync::mpsc::Sender<AppCommand>,
     activate_event: SendHandle,
+    exit_event: SendHandle,
     logs_dir: std::path::PathBuf,
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("tray".to_string())
         .spawn(move || {
-            if let Err(e) = run(state, cmd_tx, activate_event, logs_dir) {
-                tracing::error!("tray thread terminated: {e}");
+            if let Err(e) = run(state.clone(), cmd_tx, activate_event, exit_event, logs_dir) {
+                // Without the tray the app would be unreachable (closing the
+                // settings window only hides it), so shut it down.
+                tracing::error!("tray thread failed, exiting: {e}");
+                state.exit_requested.store(true, Ordering::SeqCst);
+                state.push_event(GuiEvent::ExitRequested);
             }
         })
 }
@@ -137,6 +156,7 @@ fn run(
     state: Arc<SharedAppState>,
     cmd_tx: tokio::sync::mpsc::Sender<AppCommand>,
     activate_event: SendHandle,
+    exit_event: SendHandle,
     logs_dir: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let menu = Menu::new();
@@ -205,8 +225,7 @@ fn run(
         }
     }));
 
-    let activate = activate_event;
-    let mut last_generation = u64::MAX;
+    let mut last_view: Option<TrayView> = None;
     let mut msg = MSG::default();
 
     loop {
@@ -215,19 +234,24 @@ fn run(
         }
 
         // Handle menu and tray signals queued while dispatching messages.
+        let mut toggled = false;
         let signals = std::mem::take(&mut *PENDING_SIGNALS.lock().unwrap());
         for signal in signals {
             match signal {
                 TraySignal::ShowSettings | TraySignal::TrayClick => {
                     state.push_event(GuiEvent::ShowSettings);
                 }
+                // The menu library flips a check item itself before the
+                // click is reported here, so the item already holds the
+                // requested state.
                 TraySignal::ToggleEnabled => {
-                    let enable = !enabled_item.is_checked();
+                    toggled = true;
+                    let enable = enabled_item.is_checked();
                     let _ = cmd_tx.blocking_send(AppCommand::SetEnabled(enable));
                 }
                 TraySignal::ToggleAutostart => {
-                    let enable = !autostart_item.is_checked();
-                    super::apply_autostart(&state, enable);
+                    toggled = true;
+                    super::apply_autostart(&state, autostart_item.is_checked());
                 }
                 TraySignal::OpenLogs => super::open_folder(&logs_dir),
                 TraySignal::Exit => {
@@ -237,40 +261,42 @@ fn run(
             }
         }
 
-        // Refresh icon and menu when the snapshot changed.
-        let generation = state.generation();
-        if generation != last_generation {
-            last_generation = generation;
-            let snapshot = state.live_snapshot();
-            let (label, color) = match tray_status(&snapshot) {
-                TrayStatus::Running => ("\u{25cf} Running".to_string(), GREEN),
-                TrayStatus::Paused => ("\u{25cf} Paused".to_string(), GRAY),
-                TrayStatus::Warning => ("\u{25cf} Warning".to_string(), YELLOW),
-                TrayStatus::Error => {
-                    let detail = match &snapshot.state {
-                        ProxyState::Error(e) => e,
-                        _ => "error",
-                    };
-                    (format!("\u{25cf} Error: {detail}"), RED)
-                }
-            };
-            status_item.set_text(&label);
-            conns_item.set_text(&format!("Active connections: {}", snapshot.active_connections));
-            enabled_item.set_checked(matches!(snapshot.state, ProxyState::Running | ProxyState::Starting));
-            autostart_item.set_checked(snapshot.autostart);
-            tray.set_icon(Some(make_icon(color)?))?;
-            tray.set_tooltip(Some(format!("escape-proxy \u{2014} {}", snapshot.listen_addr)))?;
+        // Refresh the icon and menu whenever anything they show changed: the
+        // settings snapshot, the connection count or the recent-failure
+        // window (the loop wakes at least once a second).
+        let view = tray_view(&state.live_snapshot(), now_ms());
+        if last_view.as_ref() != Some(&view) {
+            status_item.set_text(&view.status);
+            conns_item.set_text(&format!("Active connections: {}", view.connections));
+            enabled_item.set_checked(view.enabled);
+            autostart_item.set_checked(view.autostart);
+            tray.set_icon(Some(make_icon(view.color)?))?;
+            tray.set_tooltip(Some(format!("escape-proxy \u{2014} {}", view.listen_addr)))?;
+            last_view = Some(view);
+        } else if !toggled {
+            // The check items always mirror the snapshot, so a click that
+            // changed nothing (a failed listener retry or registry write)
+            // cannot leave a check mark flipped. The iteration that sent the
+            // click is skipped to give the controller time to apply it.
+            enabled_item.set_checked(view.enabled);
+            autostart_item.set_checked(view.autostart);
         }
 
-        // Wait for Win32 messages (tray icon/menu), the activation event, or
-        // a 1 s tick. This sleeps in the kernel, so idle CPU stays ~zero.
-        let wait = unsafe { MsgWaitForMultipleObjects(Some(&[activate.0]), false, 1000, QS_ALLINPUT) };
+        // Wait for Win32 messages (tray icon/menu), the activation or exit
+        // event, or a 1 s tick. This sleeps in the kernel, so idle CPU stays
+        // ~zero.
+        let handles = [activate_event.0, exit_event.0];
+        let wait = unsafe { MsgWaitForMultipleObjects(Some(&handles), false, 1000, QS_ALLINPUT) };
         let wait_val = wait.0;
         if wait_val == 0 {
             // WAIT_OBJECT_0: second launch activated us.
             state.push_event(GuiEvent::ShowSettings);
         } else if wait_val == 1 {
-            // WAIT_OBJECT_0 + 1: a Win32 message is pending.
+            // WAIT_OBJECT_0 + 1: `escape-proxy --exit` was run.
+            state.exit_requested.store(true, Ordering::SeqCst);
+            state.push_event(GuiEvent::ExitRequested);
+        } else if wait_val == 2 {
+            // WAIT_OBJECT_0 + 2: a Win32 message is pending.
             unsafe {
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                     let _ = TranslateMessage(&msg);
@@ -282,7 +308,59 @@ fn run(
     }
 
     drop(tray); // removes the tray icon
-    activate.close();
+    activate_event.close();
+    exit_event.close();
     tracing::info!("tray stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(state: ProxyState, last_failure_ms: u64) -> StatusSnapshot {
+        StatusSnapshot {
+            state,
+            listen_addr: "127.0.0.1:10808".to_string(),
+            active_connections: 3,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            domains: Vec::new(),
+            restrict_domains: false,
+            autostart: true,
+            show_on_startup: false,
+            max_connections: 128,
+            connect_timeout_ms: 5000,
+            last_failure_ms,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn warning_lasts_exactly_the_recent_failure_window() {
+        let now = 1_000_000;
+        let view = |failure| tray_view(&snapshot(ProxyState::Running, failure), now);
+        assert_eq!(view(0).color, GREEN);
+        assert_eq!(view(now - WARNING_WINDOW_MS + 1).color, YELLOW);
+        assert_eq!(view(now - WARNING_WINDOW_MS).color, GREEN);
+        assert_eq!(view(now).status, "\u{25cf} Warning");
+        assert!(view(now).enabled, "a warning must not hide that the proxy is up");
+    }
+
+    #[test]
+    fn errors_and_pauses_override_the_warning_colour() {
+        let now = 1_000_000;
+        assert_eq!(tray_view(&snapshot(ProxyState::Paused, now), now).color, GRAY);
+        let error = ProxyState::Error("listener failed".to_string());
+        assert_eq!(tray_view(&snapshot(error, now), now).status, "\u{25cf} Error: listener failed");
+    }
+
+    #[test]
+    fn enabled_is_checked_while_the_proxy_is_up() {
+        assert!(tray_view(&snapshot(ProxyState::Starting, 0), 0).enabled);
+        assert!(tray_view(&snapshot(ProxyState::Running, 0), 0).enabled);
+        assert!(!tray_view(&snapshot(ProxyState::Paused, 0), 0).enabled);
+        let error = ProxyState::Error("listener failed".to_string());
+        assert!(!tray_view(&snapshot(error, 0), 0).enabled);
+    }
 }

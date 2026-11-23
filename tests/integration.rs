@@ -6,6 +6,7 @@
 //! policy knobs to route through local echo servers.
 
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use escape_proxy::app::controller;
 use escape_proxy::app::state::{ProxyState, SharedAppState, StatusSnapshot};
 use escape_proxy::core::matcher::{DomainList, DomainPolicy};
 use escape_proxy::core::server::{
-    DestinationPolicy, ProxyServer, ServerConfig, SharedDomains,
+    DestinationPolicy, ProxyServer, ServerConfig, ServerStats, SharedDomains,
 };
 
 // ---------------------------------------------------------------- helpers
@@ -55,7 +56,8 @@ async fn start_proxy_with_policy(policy: DomainPolicy, max_connections: usize) -
 async fn start_proxy_with(cfg: ServerConfig, policy: DomainPolicy) -> TestProxy {
     let shared: SharedDomains = Arc::new(tokio::sync::RwLock::new(Arc::new(policy)));
     let (enabled_tx, enabled_rx) = tokio::sync::watch::channel(true);
-    let server = ProxyServer::start(cfg, shared.clone(), enabled_rx)
+    let stats = Arc::new(ServerStats::default());
+    let server = ProxyServer::start(cfg, shared.clone(), enabled_rx, stats)
         .await
         .unwrap();
     TestProxy {
@@ -249,7 +251,9 @@ async fn ip_literals_rejected_by_default_policy() {
     let (_tx, rx) = tokio::sync::watch::channel(true);
     let mut cfg = test_config("127.0.0.1:0".parse().unwrap(), 16);
     cfg.policy = DestinationPolicy::default(); // strict: no literals, no private
-    let server = ProxyServer::start(cfg, shared, rx).await.unwrap();
+    let server = ProxyServer::start(cfg, shared, rx, Arc::new(ServerStats::default()))
+        .await
+        .unwrap();
     let (_, reply) =
         socks_connect_ip(server.local_addr, "127.0.0.1".parse().unwrap(), echo.port())
             .await
@@ -423,6 +427,38 @@ async fn shutdown_closes_listener_and_sessions() {
     assert!(TcpStream::connect(addr).await.is_err());
 }
 
+#[tokio::test]
+async fn counters_survive_a_listener_restart() {
+    let echo = spawn_echo().await;
+    let shared: SharedDomains = Arc::new(tokio::sync::RwLock::new(Arc::new(
+        DomainPolicy::restricted(DomainList::new(["localhost"]).unwrap()),
+    )));
+    let stats = Arc::new(ServerStats::default());
+    let cfg = test_config("127.0.0.1:0".parse().unwrap(), 16);
+
+    let (_tx, rx) = tokio::sync::watch::channel(true);
+    let server = ProxyServer::start(cfg.clone(), shared.clone(), rx, stats.clone())
+        .await
+        .unwrap();
+    let (mut client, reply) = socks_connect(server.local_addr, "localhost", echo.port())
+        .await
+        .unwrap();
+    assert_eq!(reply[1], 0);
+    let payload = [7u8; 300];
+    client.write_all(&payload).await.unwrap();
+    let mut echoed = [0u8; 300];
+    client.read_exact(&mut echoed).await.unwrap();
+    drop(client);
+    server.shutdown().await;
+
+    // A restart (settings re-applied) must not zero the totals.
+    let (_tx, rx) = tokio::sync::watch::channel(true);
+    let server = ProxyServer::start(cfg, shared, rx, stats.clone()).await.unwrap();
+    assert!(stats.tx_bytes.load(Ordering::Relaxed) >= 300);
+    assert!(stats.rx_bytes.load(Ordering::Relaxed) >= 300);
+    server.shutdown().await;
+}
+
 // ---------------------------------------------------------------- controller
 
 fn controller_snapshot() -> StatusSnapshot {
@@ -567,6 +603,110 @@ async fn controller_lifecycle_headless() {
     );
 }
 
+#[tokio::test]
+async fn controller_keeps_serving_when_a_rebind_fails() {
+    let dir = temp_dir("rebind");
+    let path = config::config_path(&dir);
+
+    let port = free_port().await;
+    let mut initial = Config::default();
+    initial.listen_addr = format!("127.0.0.1:{port}");
+    config::save(&path, &initial).unwrap();
+
+    let state = SharedAppState::new(controller_snapshot());
+    let cmd_tx = controller::start(path.clone(), state.clone()).await;
+    eventually(|| matches!(state.live_snapshot().state, ProxyState::Running)).await;
+
+    // Something else owns the port the user switches to.
+    let squatter = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy = squatter.local_addr().unwrap().port();
+    cmd_tx
+        .send(AppCommand::ApplyAdvanced {
+            port: busy,
+            max_connections: 64,
+            connect_timeout_ms: 2500,
+        })
+        .await
+        .unwrap();
+    eventually(|| state.live_snapshot().last_error.is_some()).await;
+
+    // The previous listener is back, the rejected change is reported, and
+    // neither the running nor the saved settings moved.
+    let snap = state.live_snapshot();
+    assert!(matches!(snap.state, ProxyState::Running), "proxy must stay up: {:?}", snap.state);
+    assert_eq!(snap.listen_addr, format!("127.0.0.1:{port}"));
+    assert_eq!(snap.max_connections, 128);
+    assert_eq!(snap.connect_timeout_ms, 5000);
+    let notice = snap.last_error.unwrap_or_default();
+    assert!(notice.contains(&format!("127.0.0.1:{busy}")), "notice names the port: {notice}");
+    assert!(TcpListener::bind(("127.0.0.1", port)).await.is_err(), "previous port is still served");
+    let reloaded: Config = config::load(&path).unwrap();
+    assert_eq!(reloaded.listen_addr, format!("127.0.0.1:{port}"));
+    assert_eq!(reloaded.max_connections, 128);
+
+    drop(squatter);
+    cmd_tx.send(AppCommand::Shutdown).await.unwrap();
+}
+
+#[tokio::test]
+async fn controller_repairs_an_invalid_config_instead_of_resetting_it() {
+    let dir = temp_dir("repair");
+    let path = config::config_path(&dir);
+
+    let port = free_port().await;
+    let mut initial = Config::default();
+    initial.listen_addr = format!("127.0.0.1:{port}");
+    initial.max_connections = 0; // the one bad value
+    initial.restrict_domains = true;
+    initial.domains = vec!["Example.COM".to_string(), "not a domain".to_string()];
+    config::save(&path, &initial).unwrap();
+
+    let state = SharedAppState::new(controller_snapshot());
+    let cmd_tx = controller::start(path.clone(), state.clone()).await;
+
+    // Only the invalid settings are replaced, and the repair is reported.
+    let snap = state.live_snapshot();
+    assert!(matches!(snap.state, ProxyState::Running), "{:?}", snap.state);
+    assert_eq!(snap.listen_addr, format!("127.0.0.1:{port}"));
+    assert_eq!(snap.max_connections, 128);
+    assert!(snap.restrict_domains);
+    assert_eq!(snap.domains, vec!["example.com".to_string()]);
+    assert!(snap.last_error.is_some(), "the repair must be reported");
+
+    // Saving another setting keeps everything that was valid.
+    cmd_tx.send(AppCommand::SetShowOnStartup(true)).await.unwrap();
+    eventually(|| state.live_snapshot().show_on_startup).await;
+    let reloaded: Config = config::load(&path).unwrap();
+    assert_eq!(reloaded.listen_addr, format!("127.0.0.1:{port}"));
+    assert_eq!(reloaded.max_connections, 128);
+    assert!(reloaded.restrict_domains);
+    assert_eq!(reloaded.domains, vec!["example.com".to_string()]);
+    cmd_tx.send(AppCommand::Shutdown).await.unwrap();
+}
+
+#[tokio::test]
+async fn controller_preserves_an_unreadable_config() {
+    let dir = temp_dir("backup");
+    let path = config::config_path(&dir);
+    let broken = "domains = [unclosed";
+    std::fs::write(&path, broken).unwrap();
+
+    let state = SharedAppState::new(controller_snapshot());
+    let cmd_tx = controller::start(path.clone(), state.clone()).await;
+
+    // Falling back to defaults is reported and leaves the original recoverable.
+    assert!(state.live_snapshot().last_error.is_some(), "using defaults must be reported");
+    let backup = dir.join("config.toml.bak");
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), broken);
+
+    // The unreadable file is replaced eventually; the copy is not.
+    cmd_tx.send(AppCommand::SetShowOnStartup(true)).await.unwrap();
+    eventually(|| state.live_snapshot().show_on_startup).await;
+    assert!(config::load(&path).is_ok());
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), broken);
+    cmd_tx.send(AppCommand::Shutdown).await.unwrap();
+}
+
 // ---------------------------------------------------------------- config
 
 #[test]
@@ -615,4 +755,32 @@ fn config_rejects_bad_values() {
     cfg.connect_timeout_ms = 5000;
     cfg.domains = vec!["192.168.1.1".into()];
     assert!(cfg.validate().is_err(), "IP literals are not domains");
+}
+
+#[test]
+fn config_repair_resets_only_invalid_settings() {
+    let mut cfg = Config::default();
+    cfg.listen_addr = "0.0.0.0:10808".into();
+    cfg.max_connections = 0;
+    cfg.connect_timeout_ms = 1;
+    cfg.handshake_timeout_ms = 9000; // valid: must survive
+    cfg.restrict_domains = true;
+    cfg.domains = vec!["Example.COM".into(), "bad!name".into()];
+
+    let (repaired, problems) = cfg.repair();
+    let defaults = Config::default();
+    assert_eq!(repaired.listen_addr, defaults.listen_addr);
+    assert_eq!(repaired.max_connections, defaults.max_connections);
+    assert_eq!(repaired.connect_timeout_ms, defaults.connect_timeout_ms);
+    assert_eq!(repaired.handshake_timeout_ms, 9000);
+    assert!(repaired.restrict_domains);
+    assert_eq!(repaired.domains, vec!["example.com".to_string()]);
+    assert_eq!(problems.len(), 4, "one message per replaced setting");
+    assert!(repaired.validate().is_ok());
+
+    // A valid config is returned untouched.
+    let (same, problems) = defaults.repair();
+    assert!(problems.is_empty());
+    assert_eq!(same.listen_addr, defaults.listen_addr);
+    assert!(same.validate().is_ok());
 }

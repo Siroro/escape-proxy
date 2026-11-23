@@ -28,19 +28,39 @@ try {
     Pop-Location
 }
 
+$built = Join-Path $repo 'target\release\escape-proxy.exe'
+
 Write-Host "== stopping running instance ==" -ForegroundColor Cyan
 $running = Get-Process -Name 'escape-proxy' -ErrorAction SilentlyContinue
 if ($running) {
-    $running | ForEach-Object { $_.CloseMainWindow() | Out-Null }
-    Start-Sleep -Milliseconds 800
-    $running = Get-Process -Name 'escape-proxy' -ErrorAction SilentlyContinue
-    if ($running) { $running | Stop-Process -Force }
+    # Closing the settings window only hides it to the tray, so ask the
+    # running instance to quit through its single-instance channel. A build
+    # that does not know --exit keeps running and is force-killed below.
+    Start-Process -FilePath $built -ArgumentList '--exit'
+    foreach ($p in $running) {
+        $deadline = (Get-Date).AddSeconds(5)
+        while ((Get-Process -Id $p.Id -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {
+            Start-Sleep -Milliseconds 200
+        }
+        if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { Stop-Process -Id $p.Id -Force }
+    }
 }
 
 Write-Host "== installing to $dst ==" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dst 'logs') | Out-Null
-Copy-Item (Join-Path $repo 'target\release\escape-proxy.exe') $dst -Force
+# The image can stay locked for a moment after the process is gone.
+$installed = $false
+foreach ($attempt in 1..5) {
+    try {
+        Copy-Item $built $dst -Force -ErrorAction Stop
+        $installed = $true
+        break
+    } catch {
+        Start-Sleep -Milliseconds 500
+    }
+}
+if (-not $installed) { throw "could not replace $exe (is it still running?)" }
 
 # Keep an existing config; create a default one on first install.
 if (-not (Test-Path (Join-Path $dst 'config.toml'))) {

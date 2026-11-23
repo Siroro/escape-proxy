@@ -89,17 +89,18 @@ pub struct ProxyServer {
 impl ProxyServer {
     /// Binds the listener and spawns the accept loop. Returns once the
     /// listener is bound (or has failed), so callers can report bind errors
-    /// before proceeding.
+    /// before proceeding. `stats` comes from the caller so counters continue
+    /// across listener restarts.
     pub async fn start(
         cfg: ServerConfig,
         domains: SharedDomains,
         enabled: watch::Receiver<bool>,
+        stats: Arc<ServerStats>,
     ) -> std::io::Result<Arc<ProxyServer>> {
         let listener = TcpListener::bind(cfg.listen).await?;
         let local_addr = listener.local_addr()?;
         info!(%local_addr, "SOCKS5 listener bound");
 
-        let stats = Arc::new(ServerStats::default());
         // Sessions started before a pause share this token; pausing cancels
         // it, resuming installs a fresh one.
         let epoch = Arc::new(tokio::sync::RwLock::new(CancellationToken::new()));
@@ -325,7 +326,9 @@ impl Session {
             Ok(mut remote) => {
                 let _ = socket.write_all(&socks::success_reply()).await;
                 let dest = destination_label(&request);
-                info!(%dest, "session established");
+                // Destinations stay at debug level: at info they would add up
+                // to a browsing history in the log.
+                debug!(%dest, "session established");
                 match relay::relay(
                     socket,
                     &mut remote,

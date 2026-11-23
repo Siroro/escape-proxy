@@ -102,9 +102,9 @@ impl SharedAppState {
         self.generation.load(Ordering::SeqCst)
     }
 
-    /// Registers (or clears) the live counter source of the running server.
-    pub fn set_stats_source(&self, stats: Option<Arc<ServerStats>>) {
-        *self.stats_source.lock().unwrap() = stats;
+    /// Registers the live counter source that `live_snapshot()` merges in.
+    pub fn set_stats_source(&self, stats: Arc<ServerStats>) {
+        *self.stats_source.lock().unwrap() = Some(stats);
     }
 
     /// Reflects a change in the HKCU autostart registration.
